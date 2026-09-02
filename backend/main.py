@@ -1,27 +1,116 @@
 import os
+import logging
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from rag_engine import RAGEngine
 from ollama_client import OllamaClient
-from skills import register_student_skill, convert_currency_skill
+from skills import (
+    convert_currency_skill,
+    extract_registration_details,
+    missing_registration_fields,
+    register_student_skill,
+    registration_missing_data_message,
+)
+from langdetect import detect, DetectorFactory
+
+DetectorFactory.seed = 0
+
+LANGUAGE_NAMES = {
+    "es": "Spanish",
+    "en": "English",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "pt": "Portuguese",
+}
+ESCALATION_MESSAGES = {
+    "es": "No encuentro esta información, escalando a un agente humano.",
+    "en": "I cannot find this information, escalating to a human agent.",
+    "fr": "Je ne trouve pas cette information, je transmets votre demande à un agent humain.",
+    "de": "Ich kann diese Information nicht finden und leite Ihre Anfrage an eine menschliche Fachkraft weiter.",
+    "it": "Non trovo queste informazioni e inoltro la richiesta a un operatore umano.",
+    "pt": "Não encontro estas informações e encaminho sua solicitação para um atendente humano.",
+}
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Colombian Language Academy RAG API")
 
+DEFAULT_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", ",".join(DEFAULT_CORS_ORIGINS)).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-print("Initializing Colombian Language Academy Customer Service RAG Backend...")
 rag = RAGEngine()
-rag.load_documents()
 ollama_client = OllamaClient()
-print("Backend is ready!")
+rag_ready = False
+rag_error = "El índice RAG se está inicializando."
+
+
+def initialize_rag() -> bool:
+    """Build the local index without taking the HTTP API down if it fails."""
+    global rag_ready, rag_error
+    logger.info("Initializing Colombian Language Academy Customer Service RAG Backend...")
+    try:
+        rag.load_documents()
+        rag_ready = True
+        rag_error = ""
+        logger.info("Backend is ready with %s indexed chunks.", len(rag.chunks))
+        return True
+    except Exception as exc:
+        rag_ready = False
+        rag_error = str(exc)
+        logger.warning("RAG initialization failed; API remains available: %s", exc)
+        return False
+
+
+def initialize_rag_with_retries() -> None:
+    """Retry in the background when Ollama is started after FastAPI."""
+    while not initialize_rag():
+        logger.info("Retrying RAG initialization in 5 seconds.")
+        time.sleep(5)
+
+
+@app.on_event("startup")
+def start_rag_initialization() -> None:
+    """Do not block FastAPI startup while Ollama loads or is unavailable."""
+    threading.Thread(
+        target=initialize_rag_with_retries,
+        name="rag-initializer",
+        daemon=True,
+    ).start()
+
+
+@app.get("/health")
+def health_check():
+    """Reports API and Ollama/RAG readiness without requiring a chat request."""
+    return {
+        "api": "ok",
+        "ragReady": rag_ready,
+        "ragError": None if rag_ready else rag_error,
+    }
 
 metrics_store = {
     "queriesProcessed": 0,
@@ -30,9 +119,95 @@ metrics_store = {
 }
 
 semantic_cache = []
+pending_registrations: dict[str, dict[str, Any]] = {}
+pending_registrations_lock = threading.Lock()
+REGISTRATION_DRAFT_TTL = timedelta(minutes=30)
 
 class QueryRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(min_length=1, max_length=2_000)
+    session_id: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+def _metrics_payload(response_text: str, cached: bool = False) -> dict[str, Any]:
+    escalation_rate = (
+        (metrics_store["escalatedCount"] / metrics_store["queriesProcessed"]) * 100
+        if metrics_store["queriesProcessed"]
+        else 0.0
+    )
+    return {
+        "response": response_text,
+        "cached": cached,
+        "metrics": {
+            "queriesProcessed": metrics_store["queriesProcessed"],
+            "estimatedCost": round(metrics_store["estimatedCost"], 4),
+            "escalationRate": round(escalation_rate, 1),
+        },
+    }
+
+
+def _escalation_message(language_code: str) -> str:
+    return ESCALATION_MESSAGES.get(language_code, ESCALATION_MESSAGES["en"])
+
+
+def _registration_intent(normalized_query: str) -> bool:
+    return any(
+        phrase in normalized_query
+        for phrase in ("inscribirme", "inscripción", "registrar", "matricularme", "matrícula")
+    )
+
+
+def _clear_expired_registration_drafts(now: datetime) -> None:
+    expired_sessions = [
+        session_id
+        for session_id, draft in pending_registrations.items()
+        if now - draft["updated_at"] > REGISTRATION_DRAFT_TTL
+    ]
+    for session_id in expired_sessions:
+        pending_registrations.pop(session_id, None)
+
+
+def _handle_registration(
+    session_id: str | None, raw_query: str, normalized_query: str
+) -> str | None:
+    """Handle an enrollment without exposing personal data to the RAG/LLM."""
+    details = extract_registration_details(raw_query)
+    has_explicit_field = any(details.values())
+    has_intent = _registration_intent(normalized_query)
+    is_cancel = any(phrase in normalized_query for phrase in ("cancelar inscripción", "cancelar inscripcion", "cancelar registro"))
+    now = datetime.now(timezone.utc)
+
+    with pending_registrations_lock:
+        _clear_expired_registration_drafts(now)
+        draft = pending_registrations.get(session_id) if session_id else None
+
+        if draft and is_cancel:
+            pending_registrations.pop(session_id, None)
+            return "Cancelé la solicitud de inscripción pendiente. No se creó ningún registro."
+
+        # A normal knowledge-base question must remain available while a draft exists.
+        if not has_intent and not (draft and has_explicit_field):
+            return None
+
+        merged_details = dict(draft["details"]) if draft else {}
+        for field, value in details.items():
+            if value:
+                merged_details[field] = value
+
+        missing_fields = missing_registration_fields(merged_details)
+        if missing_fields:
+            if session_id:
+                pending_registrations[session_id] = {"details": merged_details, "updated_at": now}
+            return registration_missing_data_message(missing_fields)
+
+        if session_id:
+            pending_registrations.pop(session_id, None)
+
+    return register_student_skill(
+        name=merged_details["name"],
+        course=merged_details["course"],
+        level=merged_details["level"],
+        email=merged_details["email"],
+    )
 
 @app.post("/chat")
 def chat_endpoint(request: QueryRequest):
@@ -45,38 +220,38 @@ def chat_endpoint(request: QueryRequest):
         response_text = ""
         cached = False
 
+        # Detección automática de idioma con langdetect
+        try:
+            detected_lang = detect(raw_query)
+        except Exception:
+            detected_lang = "es"
+        
+        response_language = LANGUAGE_NAMES.get(detected_lang, "the language of the user query")
+        escalation_message = _escalation_message(detected_lang)
+
         # 1. INTERCEPCIÓN DE SKILLS LOCALES (MCP / Habilidades personalizadas)
-        if "inscribirme" in normalized_query or "registrar" in normalized_query:
+        registration_response = _handle_registration(
+            request.session_id, raw_query, normalized_query
+        )
+        if registration_response is not None:
             metrics_store["queriesProcessed"] += 1
-            response_text = register_student_skill("Estudiante Local", "Francés", "A1", "contacto@academia.com")
-            
-            escalation_rate = (metrics_store["escalatedCount"] / metrics_store["queriesProcessed"]) * 100 if metrics_store["queriesProcessed"] > 0 else 0.0
-            return {
-                "response": response_text,
-                "cached": False,
-                "metrics": {
-                    "queriesProcessed": metrics_store["queriesProcessed"],
-                    "estimatedCost": round(metrics_store["estimatedCost"], 4),
-                    "escalationRate": round(escalation_rate, 1)
-                }
-            }
+            return _metrics_payload(registration_response)
             
         elif "en dólares" in normalized_query or "usd" in normalized_query:
             metrics_store["queriesProcessed"] += 1
             response_text = convert_currency_skill(740000.0)
-            
-            escalation_rate = (metrics_store["escalatedCount"] / metrics_store["queriesProcessed"]) * 100 if metrics_store["queriesProcessed"] > 0 else 0.0
-            return {
-                "response": response_text,
-                "cached": False,
-                "metrics": {
-                    "queriesProcessed": metrics_store["queriesProcessed"],
-                    "estimatedCost": round(metrics_store["estimatedCost"], 4),
-                    "escalationRate": round(escalation_rate, 1)
-                }
-            }
+            return _metrics_payload(response_text)
 
         # 2. FLUJO NORMAL: CACHÉ Y RAG
+        if not rag_ready:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "El backend está activo, pero Ollama/RAG no está listo. "
+                    f"Detalle: {rag_error}"
+                ),
+            )
+
         metrics_store["queriesProcessed"] += 1
         current_embedding = rag._get_embedding(raw_query)
         q_emb = np.array(current_embedding)
@@ -92,10 +267,30 @@ def chat_endpoint(request: QueryRequest):
                     if norm_a > 0 and norm_b > 0:
                         similarity = dot_product / (norm_a * norm_b)
                         print(f"DEBUG - Comparando con caché. Similitud: {similarity:.2f}")
-                        # Umbral ajustado a 0.75 para mayor flexibilidad en paráfrasis
-                        if similarity >= 0.80:
-                            matched_cached_response = cached_item["response"]
-                            break
+                        
+                        # Umbral estricto para evitar falsos positivos
+                        if similarity >= 0.88:
+                            cached_q = cached_item["query"].lower()
+                            
+                            # Doble validación de intención (precio vs general)
+                            cached_is_price = any(w in cached_q for w in ["cuánto", "precio", "costo", "vale", "dólares", "usd"])
+                            query_is_price = any(w in normalized_query for w in ["cuánto", "precio", "costo", "vale", "dólares", "usd"])
+                            
+                            # Validación estricta por idioma/materia para evitar contaminación cruzada (ej. inglés vs alemán)
+                            languages = ["inglés", "francés", "alemán", "italiano"]
+                            same_lang = True
+                            for lang in languages:
+                                if (lang in cached_q) != (lang in normalized_query):
+                                    same_lang = False
+                                    break
+                            
+                            if (
+                                cached_is_price == query_is_price
+                                and same_lang
+                                and cached_item.get("language") == detected_lang
+                            ):
+                                matched_cached_response = cached_item["response"]
+                                break
 
         if matched_cached_response:
             cached = True
@@ -106,10 +301,14 @@ def chat_endpoint(request: QueryRequest):
             
             if not retrieved_chunks:
                 metrics_store["escalatedCount"] += 1
-                is_english = any(word in raw_query.lower() for word in ["what", "how", "do", "you", "is", "are", "cost", "where", "can"])
-                response_text = "I cannot find this information, escalating to a human agent." if is_english else "No encuentro esta información, escalando a un agente humano."
+                response_text = escalation_message
             else:
-                response_text = ollama_client.generate_response(raw_query, retrieved_chunks)
+                response_text = ollama_client.generate_response(
+                    raw_query,
+                    retrieved_chunks,
+                    response_language,
+                    escalation_message,
+                )
                 
                 lower_resp = response_text.lower()
                 if (
@@ -126,20 +325,17 @@ def chat_endpoint(request: QueryRequest):
                 semantic_cache.append({
                     "query": raw_query,
                     "embedding": current_embedding,
-                    "response": response_text
+                    "response": response_text,
+                    "language": detected_lang,
                 })
 
-        escalation_rate = (metrics_store["escalatedCount"] / metrics_store["queriesProcessed"]) * 100 if metrics_store["queriesProcessed"] > 0 else 0.0
-
-        return {
-            "response": response_text,
-            "cached": cached,
-            "metrics": {
-                "queriesProcessed": metrics_store["queriesProcessed"],
-                "estimatedCost": round(metrics_store["estimatedCost"], 4),
-                "escalationRate": round(escalation_rate, 1)
-            }
-        }
+        return _metrics_payload(response_text, cached)
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unexpected error while processing /chat")
+        raise HTTPException(
+            status_code=500,
+            detail="Ocurrió un error interno al procesar la consulta.",
+        )

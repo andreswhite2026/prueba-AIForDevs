@@ -4,19 +4,31 @@ import numpy as np
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
-ANALIZAR_DIR = os.getenv("ANALIZAR_DIR", "analizar")
+ANALIZAR_DIR = os.getenv("ANALIZAR_DIR", os.path.join(BASE_DIR, "analizar"))
+
+
+class OllamaConnectionError(RuntimeError):
+    """Raised when the local Ollama service cannot fulfil a RAG request."""
 
 class RAGEngine:
     def __init__(self, analizar_dir=ANALIZAR_DIR):
-        self.analizar_dir = analizar_dir
+        self.analizar_dir = (
+            analizar_dir
+            if os.path.isabs(analizar_dir)
+            else os.path.join(BASE_DIR, analizar_dir)
+        )
         self.chunks = []
         self.embeddings = []
         
     def load_documents(self):
+        # Allow a later retry after Ollama becomes available without duplicating data.
+        self.chunks = []
+        self.embeddings = []
         if not os.path.exists(self.analizar_dir):
             os.makedirs(self.analizar_dir, exist_ok=True)
             print(f"Directory '{self.analizar_dir}' created. Please place 3 business documents inside.")
@@ -51,11 +63,21 @@ class RAGEngine:
             "model": EMBEDDING_MODEL,
             "prompt": text
         }
-        response = requests.post(url, json=payload)
+        try:
+            response = requests.post(url, json=payload, timeout=120)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise OllamaConnectionError(
+                f"No fue posible conectar con Ollama en {OLLAMA_BASE_URL}. "
+                "Inícialo con `ollama serve` y verifica el modelo de embeddings."
+            ) from exc
+
         if response.status_code == 200:
             return response.json().get("embedding", [])
-        else:
-            raise Exception(f"Failed to fetch embedding from Ollama: {response.text}")
+
+        raise OllamaConnectionError(
+            f"Ollama no pudo crear embeddings con el modelo '{EMBEDDING_MODEL}'."
+        )
 
     def retrieve(self, query, top_k=3):
         if not self.embeddings:

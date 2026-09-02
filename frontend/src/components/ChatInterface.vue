@@ -20,6 +20,17 @@ const inputMessage = ref('');
 const loading = ref(false);
 const chatContainer = ref<HTMLElement | null>(null);
 
+const SESSION_STORAGE_KEY = 'academy-rag-chat-session-id';
+const getSessionId = () => {
+  const existingSessionId = localStorage.getItem(SESSION_STORAGE_KEY);
+  if (existingSessionId) return existingSessionId;
+
+  const sessionId = crypto.randomUUID();
+  localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+  return sessionId;
+};
+const sessionId = getSessionId();
+
 const scrollToBottom = async () => {
   await nextTick();
   if (chatContainer.value) {
@@ -44,13 +55,21 @@ const sendMessage = async () => {
   loading.value = true;
 
   try {
+    // Vite sends this same-origin route to 127.0.0.1:8000 (see vite.config.ts).
+    // The browser therefore does not perform a CORS request in development.
     const response = await fetch('/api/chat', {
       method: 'POST',
+      // /api is served by the same Vite origin and proxied server-side.
+      // Explicitly avoid Firefox treating this development request as CORS.
+      mode: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: userText })
+      body: JSON.stringify({ prompt: userText, session_id: sessionId })
     });
 
-    if (!response.ok) throw new Error('Error en la comunicación con el servidor');
+    if (!response.ok) {
+      const errorBody = await response.json().catch(() => null);
+      throw new Error(errorBody?.detail || `Error HTTP ${response.status}`);
+    }
 
     const data = await response.json();
 
@@ -72,10 +91,11 @@ const sendMessage = async () => {
     }
 
   } catch (error) {
+    const detail = error instanceof Error ? error.message : 'Error desconocido';
     messages.value.push({
       id: (Date.now() + 1).toString(),
       sender: 'assistant',
-      text: 'Lo siento, ocurrió un error al conectar con el servidor local de Ollama.',
+      text: `No pude procesar la consulta. ${detail}`,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       cached: false
     });
