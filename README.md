@@ -107,7 +107,7 @@ Entregables incluidos
 
 - Documentos de diseño y técnicos (`docs/*.md`, `docs/*.pdf`).
 - Diagramas UML en Mermaid y Draw.io (`docs/diagrams/`).
-- Mockups SVG en `docs/mockups/`.
+- Mockups IMG en `docs/mockups/`.
 
 Guía rápida
 ----------
@@ -220,16 +220,9 @@ Archivos de referencia
 - Documentación del backend: [backend/backend.md](backend/backend.md#L1)
 - Documentación del frontend: [frontend/frontend.md](frontend/frontend.md#L1)
 
-Ver diagramas (Mermaid) en Visual Studio Code
+Ver diagramas (dawio) en Visual Studio Code
 ---------------------------------------------
-Si la persona que recibe el proyecto quiere ver o editar los diagramas Mermaid (`.mmd` / `.mermaid`) dentro de Visual Studio Code, instale la extensión "Mermaid MMD Tools" desde la vista de Extensiones. Pasos rápidos:
+Si la persona que recibe el proyecto quiere ver o editar los diagramas Mermaid (`.drawio`) dentro de Visual Studio Code, instale la extensión "Mermaid MMD Tools" desde la vista de Extensiones. Pasos rápidos:
 
 - Abra Visual Studio Code y vaya a la vista de Extensiones (Ctrl+Shift+X). Busque e instale "Mermaid MMD Tools".
-- Abra cualquier archivo `.mmd` o `.mermaid` en Visual Studio Code.
-- Haga clic en el ícono del diagrama en la barra de título del editor para abrir la vista previa.
-- El diagrama se mostrará en un panel de vista previa con funciones para desplazarse y hacer zoom.
-
-Si quieres, puedes añadir una captura (foto) indicando exactamente dónde está el ícono; colócala en `docs/images/` y la referencia aquí para que quien abra el repositorio la vea.
-
----
-Último cambio: README principal traducido y pasos de empaquetado añadidos.
+- Abra cualquier archivo `dawio` en Visual Studio Code.
