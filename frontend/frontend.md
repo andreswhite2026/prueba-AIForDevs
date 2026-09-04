@@ -50,4 +50,19 @@ No se almacena el contenido del chat ni información personal en el frontend; el
 npm run build
 ```
 
+Tailwind CSS
+------------
+Para instalar Tailwind (instrucción mínima requerida):
+
+```bash
+cd frontend
+npm install tailwindcss @tailwindcss/vite
+```
+
+Asegúrese de que `src/style.css` contenga las directivas:
+
+```
+@import "tailwindcss";
+```
+
 El comando valida TypeScript y genera la versión de producción en `frontend/dist/`.

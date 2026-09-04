@@ -5,6 +5,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 import numpy as np
+import re
+import unicodedata
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -150,10 +152,16 @@ def _escalation_message(language_code: str) -> str:
 
 
 def _registration_intent(normalized_query: str) -> bool:
-    return any(
-        phrase in normalized_query
-        for phrase in ("inscribirme", "inscripción", "registrar", "matricularme", "matrícula")
-    )
+    # Detecta variaciones comunes de intención de inscripción.
+    # Buscamos raíces y formas conjugadas para capturar frases como
+    # "me quiero inscribir", "quiero inscribirme", "inscripción", "registrar", "matrícula", etc.
+    try:
+        return bool(
+            re.search(r"\b(inscrib|inscripc|matricul|registr|apunt|inscribir|registrar)\w*\b", normalized_query)
+        )
+    except Exception:
+        # En caso de cualquier error en la regex, no bloquear la ruta principal.
+        return False
 
 
 def _clear_expired_registration_drafts(now: datetime) -> None:
@@ -257,6 +265,11 @@ def chat_endpoint(request: QueryRequest):
         q_emb = np.array(current_embedding)
 
         matched_cached_response = None
+        def _normalize_text(s: str) -> str:
+            return "".join(
+                c for c in unicodedata.normalize("NFD", s.lower()) if unicodedata.category(c) != "Mn"
+            )
+
         if semantic_cache and len(q_emb) > 0:
             for cached_item in semantic_cache:
                 cached_emb = np.array(cached_item["embedding"])
@@ -270,25 +283,26 @@ def chat_endpoint(request: QueryRequest):
                         
                         # Umbral estricto para evitar falsos positivos
                         if similarity >= 0.88:
-                            cached_q = cached_item["query"].lower()
-                            
-                            # Doble validación de intención (precio vs general)
-                            cached_is_price = any(w in cached_q for w in ["cuánto", "precio", "costo", "vale", "dólares", "usd"])
-                            query_is_price = any(w in normalized_query for w in ["cuánto", "precio", "costo", "vale", "dólares", "usd"])
-                            
-                            # Validación estricta por idioma/materia para evitar contaminación cruzada (ej. inglés vs alemán)
-                            languages = ["inglés", "francés", "alemán", "italiano"]
-                            same_lang = True
-                            for lang in languages:
-                                if (lang in cached_q) != (lang in normalized_query):
-                                    same_lang = False
-                                    break
-                            
-                            if (
-                                cached_is_price == query_is_price
-                                and same_lang
-                                and cached_item.get("language") == detected_lang
-                            ):
+                            cached_q = cached_item["query"]
+                            # Normalizar para coincidencias insensibles a acentos
+                            cached_q_norm = _normalize_text(cached_q)
+                            query_norm = _normalize_text(normalized_query)
+
+                            # Doble validación de intención (precio vs general) con más sinónimos
+                            price_keywords = [
+                                "cuanto", "cuánto", "precio", "precios", "costo", "costos",
+                                "valor", "valores", "cuestan", "cuesta", "costar",
+                                "dolares", "usd", "cop", "pesos",
+                            ]
+                            cached_is_price = any(w in cached_q_norm for w in price_keywords)
+                            query_is_price = any(w in query_norm for w in price_keywords)
+
+                            # Validación por idioma basada solo en la etiqueta de idioma almacenada
+                            same_lang = (
+                                cached_item.get("language") == detected_lang or cached_item.get("language") is None
+                            )
+
+                            if cached_is_price == query_is_price and same_lang:
                                 matched_cached_response = cached_item["response"]
                                 break
 
@@ -310,15 +324,44 @@ def chat_endpoint(request: QueryRequest):
                     escalation_message,
                 )
                 
-                lower_resp = response_text.lower()
-                if (
-                    "no encontr" in lower_resp or 
-                    "cannot find" in lower_resp or 
-                    "escalating" in lower_resp or 
-                    "escalando" in lower_resp or
-                    "oficina de admisiones" in lower_resp or
-                    "admissions office" in lower_resp
-                ):
+                def _is_escalation_response(text: str) -> bool:
+                    """Detecta si la respuesta representa una falta de información real
+                    que justifique escalar a un operador humano.
+
+                    Reglas principales:
+                    - Si la respuesta contiene montos/cifras monetarias (ej. $ o COP o USD),
+                      asumimos que no es una falta de información y NO escalamos.
+                    - Si la respuesta contiene frases de incapacidad/ausencia de datos
+                      ("no puedo", "no encuentro", "cannot find", "no hay información", etc.)
+                      marcamos escalación.
+                    - Palabras explícitas de escalación ("escalar", "escalating", "oficina de admisiones")
+                      también indican escalado.
+                    """
+                    if not text:
+                        return False
+                    lower = text.lower()
+
+                    # Si contiene signos de moneda o patrones de precio, no escalamos
+                    if re.search(r"\$\s?\d|\d+\s?cop\b|cop\b|usd\b|\beuros?\b", lower):
+                        return False
+
+                    inability_pattern = re.compile(
+                        r"\b(no\s+(?:encontr(?:é|o|ar)|puedo|tenemos|ten[eí]s|tengo)|"
+                        r"no\s+hay\s+informaci[oó]n|cannot\s+find|can't\s+find|i\s+can't\s+find|"
+                        r"no\s+es\s+posible|no\s+puedo\s+ayudar|no\s+tenemos)\b",
+                        re.IGNORECASE,
+                    )
+
+                    if inability_pattern.search(lower):
+                        return True
+
+                    # Frases explícitas de escalación
+                    if any(k in lower for k in ["escalar", "escalating", "escalando", "oficina de admisiones", "admissions office", "contacte" , "contactar"]):
+                        return True
+
+                    return False
+
+                if _is_escalation_response(response_text):
                     metrics_store["escalatedCount"] += 1
 
             if len(q_emb) > 0:

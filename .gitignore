@@ -1,3 +1,26 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+
+# Environment / secrets
+.env
+backend/.env
+
+# Local data (inscripciones, base de datos temporal)
+backend/student_registrations.json
+
+# Node / frontend
+frontend/node_modules/
+node_modules/
+dist/
+
+# OS / editors
+.DS_Store
+.vscode/
+
+# Build outputs
+build/
 # Python & Backend
 .venv
 backend/__pycache__/
